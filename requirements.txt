@@ -5,3 +5,9 @@ torchvision
 pillow
 python-multipart
 pydantic
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-anthropic
+langgraph
