@@ -1,16 +1,26 @@
 import io
 import base64
+from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
 import torch
 import torchvision.transforms as transforms
 from torchvision.models import resnet18, ResNet18_Weights
 from PIL import Image
 
-app = FastAPI(title="Vision AI Agent API")
+# LangChain & LangGraph Integrations
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+from langgraph.prebuilt import create_react_agent
 
-# Enable CORS for Netlify and SoloLearn sandbox environments
+# Choose your provider (uncomment preferred model)
+from langchain_openai import ChatOpenAI
+# from langchain_anthropic import ChatAnthropic
+
+app = FastAPI(title="LangChain Tool-Calling Vision Agent")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +29,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Tool 1: Vision Model Tool
+# ---------------------------------------------------------
+# 1. PyTorch Setup & Global State
+# ---------------------------------------------------------
 weights = ResNet18_Weights.DEFAULT
 vision_model = resnet18(weights=weights)
 vision_model.eval()
@@ -32,66 +44,128 @@ transform = transforms.Compose([
 ])
 categories = weights.meta["categories"]
 
-def tool_classify_image(image: Image.Image) -> dict:
-    """Executes computer vision inference on the provided image."""
-    tensor = transform(image).unsqueeze(0)
+# Temporary global buffer to pass image tensor into tool
+current_image_buffer: Optional[Image.Image] = None
+
+
+# ---------------------------------------------------------
+# 2. Define LangChain Custom Tool
+# ---------------------------------------------------------
+@tool
+def run_pytorch_resnet_classifier() -> str:
+    """Runs a local PyTorch ResNet-18 model on the currently uploaded image.
+    Returns the top 3 visual predictions with confidence percentages.
+    """
+    global current_image_buffer
+    if current_image_buffer is None:
+        return "Error: No image loaded into the vision buffer."
+
+    tensor = transform(current_image_buffer).unsqueeze(0)
     with torch.no_grad():
         outputs = vision_model(tensor)
         probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-    
+
     top_prob, top_catid = torch.topk(probabilities, 3)
     results = []
     for i in range(3):
-        results.append({
-            "label": categories[top_catid[i].item()],
-            "confidence": round(top_prob[i].item() * 100, 2)
-        })
-    return {"top_predictions": results}
+        label = categories[top_catid[i].item()]
+        conf = round(top_prob[i].item() * 100, 2)
+        results.append(f"{label} ({conf}%)")
 
-# Agent Execution Loop
+    return f"PyTorch Vision Output: {', '.join(results)}"
+
+
+# ---------------------------------------------------------
+# 3. Instantiate Model and Agent Loop
+# ---------------------------------------------------------
+# OpenAI Configuration
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+# Alternative Anthropic Claude Configuration:
+# llm = ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0)
+
+tools = [run_pytorch_resnet_classifier]
+
+system_prompt = (
+    "You are an expert Vision AI Agent. Your goal is to identify objects in images "
+    "by combining your visual reasoning with specialized computer vision tools. "
+    "When presented with an image, ALWAYS call the `run_pytorch_resnet_classifier` tool "
+    "to obtain quantitative predictions before synthesizing your final analysis."
+)
+
+agent_executor = create_react_agent(
+    model=llm,
+    tools=tools,
+    prompt=system_prompt
+)
+
+
+# ---------------------------------------------------------
+# 4. API Endpoints
+# ---------------------------------------------------------
 class AgentResponse(BaseModel):
     status: str
-    thought_process: list[str]
-    primary_classification: str
-    confidence: float
-    agent_summary: str
+    thought_process: List[str]
+    final_answer: str
+
 
 @app.get("/")
 def check_health():
-    return {"status": "AI Agent Core Online"}
+    return {"status": "LangChain Vision Agent Core Online"}
+
 
 @app.post("/agent/analyze", response_model=AgentResponse)
 async def run_agent(file: UploadFile = File(...)):
-    thoughts = []
-    
-    # Step 1: Agent receives and validates input
-    thoughts.append("Agent Goal: Analyze uploaded image and perform structured classification.")
+    global current_image_buffer
+    thought_process = []
+
+    # Read and buffer image
     contents = await file.read()
     try:
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        thoughts.append(f"Received image of size {image.size}. Image successfully decoded.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid image file uploaded.")
+        current_image_buffer = Image.open(io.BytesIO(contents)).convert("RGB")
+        base64_image = base64.b64encode(contents).decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file format.")
 
-    # Step 2: Agent decides to call the PyTorch Vision Tool
-    thoughts.append("Action: Executing PyTorch ResNet18 Computer Vision Tool...")
-    vision_results = tool_classify_image(image)
-    top_pred = vision_results["top_predictions"][0]
-    thoughts.append(f"Tool Output: Detected '{top_pred['label']}' with {top_pred['confidence']}% confidence.")
-
-    # Step 3: Agent synthesizes result and generates reasoning summary
-    if top_pred['confidence'] > 70.0:
-        summary = f"High confidence match! The target object is identified as a {top_pred['label']}."
-    else:
-        alt_label = vision_results["top_predictions"][1]["label"]
-        summary = f"Moderate confidence match for {top_pred['label']}. Secondary candidate: {alt_label}."
-    
-    thoughts.append("Final Synthesis: Formatting structured agent payload for client.")
-
-    return AgentResponse(
-        status="success",
-        thought_process=thoughts,
-        primary_classification=top_pred["label"],
-        confidence=top_pred["confidence"],
-        agent_summary=summary
+    # Format multi-modal message for LLM
+    input_message = HumanMessage(
+        content=[
+            {"type": "text", "text": "Analyze this image using your local PyTorch classifier tool and explain what you see."},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+            },
+        ]
     )
+
+    thought_process.append("User query & image received by Agent.")
+
+    try:
+        # Execute LangGraph Tool-Calling Agent Loop
+        events = agent_executor.stream(
+            {"messages": [input_message]},
+            stream_mode="values"
+        )
+
+        final_answer = ""
+        for event in events:
+            messages = event.get("messages", [])
+            if messages:
+                latest = messages[-1]
+                # Log tool calls or standard messages
+                if hasattr(latest, "tool_calls") and latest.tool_calls:
+                    for tc in latest.tool_calls:
+                        thought_process.append(f"Agent Decision: Calling Tool `{tc['name']}`")
+                elif latest.type == "tool":
+                    thought_process.append(f"Tool Result: {latest.content}")
+                elif latest.type == "ai" and latest.content:
+                    final_answer = latest.content
+
+        return AgentResponse(
+            status="success",
+            thought_process=thought_process,
+            final_answer=final_answer
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
